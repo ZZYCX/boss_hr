@@ -1,0 +1,4 @@
+interface:
+  display_name: "Boss HR Assistant"
+  short_description: "通过 OpenClaw Browser Relay 接管 Boss 会话并处理候选人沟通。"
+  default_prompt: "Use $boss-hr-assistant with OpenClaw Browser Relay to find the logged-in Boss tab, snapshot the page, run boss_hr.py plan-next-action, execute returned browser_actions, run post_actions after confirmed sends, resolve downloaded resumes, and rename/archive them."
