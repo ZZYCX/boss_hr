@@ -2,7 +2,7 @@
 
 [openclaw]
 browser_mode = "browser-relay"
-preferred_browser_profile = "chrome-relay"
+preferred_browser_profile = "chrome"
 fallback_browser_profile = "user"
 snapshot_ref_mode = "aria"
 snapshot_limit = 120
@@ -27,12 +27,22 @@ chat_ready_keywords = ["沟通", "聊天", "候选人", "牛人", "未读", "在
 search_box_labels = ["搜索30天内的联系人"]
 conversation_filter_labels = ["全部", "未读", "新招呼", "仅沟通", "更多"]
 ignored_thread_labels = ["BOSS直聘", "首页", "职位", "公司", "校园", "海归", "APP", "有了", "海外", "无障碍专区", "在线客服", "消息", "简历", "查看职位", "更新简历"]
+unread_marker_keywords = ["未读", "新招呼"]
 thread_item_container_selectors = ["[role='listitem']", "li", ".chat-item", ".dialog-item", ".item-friend", ".friend-item", ".geek-item"]
 thread_item_clickable_ancestor_selectors = ["a", "button", "[role='button']", "[role='link']", "[role='listitem']", "li", ".chat-item", ".dialog-item", ".item-friend", ".friend-item", ".geek-item"]
+thread_open_container_selectors = [".geek-item-wrap", ".geek-item", "[role='listitem']", "li", ".chat-item", ".dialog-item", ".item-friend", ".friend-item"]
 send_button_texts = ["发送"]
 reply_input_selectors = ["#boss-chat-editor-input", "textarea", "[contenteditable='true']"]
 send_button_selectors = ["div.submit.active", "button[type='submit']"]
 resume_download_selectors = ["a[href*='resume']", ".resume-item a", ".btn-download"]
+resume_accept_selectors = ["a.btn"]
+resume_accept_texts = ["同意", "同意接收附件简历", "接收附件简历"]
+resume_preview_selectors = [".message-card-wrap.boss-green .card-btn"]
+resume_preview_texts = ["点击预览附件简历", "预览附件简历", "预览简历"]
+resume_preview_modal_selectors = [".boss-popup", ".boss-popup__wrapper"]
+resume_download_icon_selectors = ["#icon-attacthment-download"]
+resume_download_host_selectors = ["span"]
+resume_preview_close_selectors = [".boss-popup__close"]
 no_contacts_texts = ["30天内暂无联系人"]
 no_message_texts = ["当前暂无消息"]
 

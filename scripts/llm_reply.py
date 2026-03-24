@@ -102,20 +102,17 @@ def unwrap_llm_result(payload: dict[str, Any]) -> dict[str, Any]:
 def normalize_llm_result(payload: dict[str, Any], stage_hint: str) -> dict[str, Any]:
     result = unwrap_llm_result(payload)
 
-    reply_text = ""
-    for key in ("reply_text", "reply", "message", "content"):
-        value = result.get(key)
-        if isinstance(value, str) and value.strip():
-            reply_text = normalize_reply_text(value)
-            break
-
+    reply_value = result.get("reply_text")
+    if not isinstance(reply_value, str) or not reply_value.strip():
+        raise ValueError("llm-task result must include non-empty reply_text.")
+    reply_text = normalize_reply_text(reply_value)
     if not reply_text:
-        raise ValueError("llm-task result must include reply_text.")
+        raise ValueError("llm-task result reply_text cannot be blank after normalization.")
 
-    raw_stage = str(result.get("conversation_stage") or result.get("stage") or stage_hint or "").strip()
-    conversation_stage = raw_stage if raw_stage in VALID_STAGES else stage_hint
-    if not conversation_stage:
-        conversation_stage = "first_contact"
+    stage_value = result.get("conversation_stage")
+    if not isinstance(stage_value, str) or stage_value.strip() not in VALID_STAGES:
+        raise ValueError("llm-task result must include valid conversation_stage.")
+    conversation_stage = stage_value.strip()
 
     return {
         "reply_text": reply_text,

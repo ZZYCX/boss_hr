@@ -17,21 +17,25 @@ Skill 职责：
 - 解析 snapshot
 - 生成 `llm-task` 请求
 - 消费 `llm-task` 结构化结果
-- 输出发送动作
+- 输出发送与简历动作链
 - 识别最新下载文件
 
 ## 主链路
 
 1. `session-check`
 2. `plan-next-action`
-3. 如果返回 `open_thread`，执行 `data.browser_actions`
-4. 重新 `snapshot`
-5. 再次运行 `plan-next-action`
-6. 如果返回 `llm_reply_required`，直接调用 `data.llm_task_request`
-7. 调用 `finalize-reply-plan`
-8. 执行返回的 `browser_actions`
-9. 执行返回的 `post_actions`
-10. 如果有简历下载，只走 `resolve-download`
+3. 如果返回 `wait_for_unread`，结束本轮轮询
+4. 如果返回 `open_thread`，执行 `data.browser_actions`
+5. 重新 `snapshot`
+6. 再次运行 `plan-next-action`
+7. 如果返回 `llm_reply_required`，直接调用 `data.llm_task_request`
+8. 调用 `finalize-reply-plan`
+9. 执行返回的 `browser_actions`
+10. 执行返回的 `post_actions`
+11. 如果需要确认本地落盘结果，可选调用 `resolve-download`
+
+默认无需指定“当前候选人”。
+Skill 在会话列表页只检查是否存在未读会话；有未读则选择首个未读会话继续执行，没有未读则返回 `wait_for_unread`。
 
 ## 命令
 
@@ -48,14 +52,18 @@ python scripts/boss_hr.py --config config/skill-config.toml mark-thread ...
 
 - 回复内容统一交给 OpenClaw `llm-task`
 - 回复不再由本地模板脚本生成
+- `llm-task` 结果不符合 schema 时直接失败
 - 不在正常流程里做发送前后额外校验
 - 不使用消息指纹去重
-- `plan-next-action` 只负责打开会话或产出 `llm_task_request`
-- `finalize-reply-plan` 只负责把 `llm-task` 结果变成发送动作
+- `plan-next-action` 只负责选择未读会话、打开会话或产出 `llm_task_request`
+- `finalize-reply-plan` 只负责把 `llm-task` 结果变成发送与简历动作链
 - 输入框优先用 `#boss-chat-editor-input`
 - 发送按钮优先用 `div.submit.active`
+- 打开候选人会话优先用页面内 `evaluate` 精确点击外层会话容器
+- 会话列表只用于识别未读，不把列表消息摘要当作当前聊天上下文
+- 简历下载固定为：同意 -> 预览 -> 下载 -> 关闭预览
 - `post_actions` 只负责记录状态
-- 简历只下载，不做后续文件处理
+- `resolve-download` 只是下载后的可选确认步骤，不是主流程前置条件
 
 ## 参考文件
 

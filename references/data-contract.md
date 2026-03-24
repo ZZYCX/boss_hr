@@ -44,6 +44,7 @@
 ```
 
 OpenClaw 必须直接使用这里返回的 `tool` 和 `args` 调用 `llm-task`。
+如果 `plan-next-action` 返回 `wait_for_unread`，说明当前列表中没有未读会话，本轮不应调用 `llm-task`。
 
 ## 3. `llm-task` 结果
 
@@ -77,6 +78,21 @@ OpenClaw 必须直接使用这里返回的 `tool` 和 `args` 调用 `llm-task`�
         "executor": "browser",
         "kind": "click",
         "selector": "div.submit.active"
+      },
+      {
+        "executor": "browser",
+        "kind": "click",
+        "selector": "a.btn"
+      },
+      {
+        "executor": "browser",
+        "kind": "wait",
+        "selector": ".message-card-wrap.boss-green .card-btn"
+      },
+      {
+        "executor": "browser",
+        "kind": "evaluate",
+        "script": "(() => { /* click download host span */ })()"
       }
     ],
     "post_actions": [

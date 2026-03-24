@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from llm_reply import build_candidate_payload, build_llm_task, load_json_arg, normalize_llm_result
-from parse_boss_snapshot import load_snapshot_text, parse_snapshot
+from parse_boss_snapshot import build_thread_js_fallback, load_snapshot_text, parse_snapshot
 from resolve_download import parse_known_files, resolve_download
 from validate_config import load_toml, validate_config
 
@@ -242,42 +242,227 @@ def choose_browser_target(target_block: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_open_thread_action(thread_target: dict[str, Any], candidate_name: str) -> dict[str, Any]:
-    selectors = thread_target.get("selector_candidates", [])
+def dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def build_click_action(
+    description: str,
+    target_block: dict[str, Any],
+    *,
+    target_type: str,
+    primary_selector: str | None = None,
+) -> dict[str, Any]:
+    target = choose_browser_target(target_block)
+    selectors = dedupe_strings(([primary_selector] if primary_selector else []) + list(target.get("selectors", [])))
+    selector = primary_selector or target.get("selector", "")
     return {
         "executor": "browser",
         "kind": "click",
-        "description": "打开候选人会话",
-        "target_type": "thread_item",
-        "target_preference": "container_selector_first",
-        "candidate_name": candidate_name,
+        "description": description,
+        "target_type": target_type,
+        "target_preference": "selector_first",
         "ref": "",
-        "label": thread_target.get("label", ""),
-        "selector": selectors[0] if selectors else "",
+        "label": target.get("label", ""),
+        "selector": selector,
         "selectors": selectors,
-        "fallback_refs": (
-            [{"ref": thread_target.get("ref", ""), "label": thread_target.get("label", "")}]
-            if thread_target.get("ref")
-            else []
-        ),
-        "fallback_clicks": [
-            {
-                "method": "selector",
-                "description": "优先点击对话项外层可点击容器。",
-                "selectors": selectors,
-            },
-            {
-                "method": "ref",
-                "description": "如果容器 selector 失败，再尝试 snapshot ref。",
-                "ref": thread_target.get("ref", ""),
-            },
-            {
-                "method": "javascript",
-                "description": "最后执行页面内的回退点击脚本。",
-                "script": thread_target.get("js_click_fallback", ""),
-            },
-        ],
+        "fallback_refs": target.get("refs", []),
     }
+
+
+def build_wait_action(
+    description: str,
+    *,
+    selector: str | None = None,
+    selectors: list[str] | None = None,
+    fn: str | None = None,
+    timeout_ms: int | None = None,
+    seconds: float | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    action: dict[str, Any] = {
+        "executor": "browser",
+        "kind": "wait",
+        "description": description,
+    }
+    if selector:
+        action["selector"] = selector
+    if selectors:
+        action["selectors"] = dedupe_strings(selectors)
+    if fn:
+        action["fn"] = fn
+    if timeout_ms is not None:
+        action["timeout_ms"] = timeout_ms
+    if seconds is not None:
+        action["seconds"] = seconds
+    if error_message:
+        action["error_message"] = error_message
+    return action
+
+
+def build_evaluate_action(
+    description: str,
+    script: str,
+    *,
+    error_message: str | None = None,
+    timeout_ms: int | None = None,
+) -> dict[str, Any]:
+    action = {
+        "executor": "browser",
+        "kind": "evaluate",
+        "description": description,
+        "script": script,
+    }
+    if error_message:
+        action["error_message"] = error_message
+    if timeout_ms is not None:
+        action["timeout_ms"] = timeout_ms
+    return action
+
+
+def build_open_thread_action(config: dict[str, Any], thread_target: dict[str, Any] | None, candidate_name: str) -> list[dict[str, Any]]:
+    script = (
+        thread_target.get("js_click_fallback", "")
+        if thread_target and thread_target.get("js_click_fallback")
+        else build_thread_js_fallback(candidate_name, config)
+    )
+    return [
+        {
+            "executor": "browser",
+            "kind": "evaluate",
+            "description": "按候选人姓名精确打开会话",
+            "target_type": "thread_item",
+            "candidate_name": candidate_name,
+            "script": script,
+            "error_message": f"未找到候选人“{candidate_name}”的可点击会话容器。",
+            "selector": (thread_target.get("selector_candidates", [""])[0] if thread_target else ""),
+            "selectors": dedupe_strings(
+                list(thread_target.get("selector_candidates", []) if thread_target else [])
+                + list(config["browser_actions"]["thread_open_container_selectors"])
+            ),
+            "fallback_refs": (
+                [{"ref": thread_target.get("ref", ""), "label": thread_target.get("label", "")}]
+                if thread_target and thread_target.get("ref")
+                else []
+            ),
+        },
+        build_wait_action("等待会话面板刷新", seconds=1.0, timeout_ms=1000),
+    ]
+
+
+def build_resume_download_script(config: dict[str, Any]) -> str:
+    browser_actions = config["browser_actions"]
+    return "\n".join(
+        [
+            "(() => {",
+            (
+                "  const iconSelectors = "
+                + json.dumps(browser_actions["resume_download_icon_selectors"], ensure_ascii=False)
+                + ";"
+            ),
+            (
+                "  const hostSelectors = "
+                + json.dumps(browser_actions["resume_download_host_selectors"], ensure_ascii=False)
+                + ";"
+            ),
+            "  const icons = [];",
+            "  const seen = new Set();",
+            "  for (const selector of iconSelectors) {",
+            "    for (const node of document.querySelectorAll(selector)) {",
+            "      if (seen.has(node)) continue;",
+            "      seen.add(node);",
+            "      icons.push({ selector, node });",
+            "    }",
+            "  }",
+            "  for (const item of icons) {",
+            "    for (const selector of hostSelectors) {",
+            "      const host = item.node.closest(selector);",
+            "      if (host) {",
+            "        host.click();",
+            "        return { ok: true, strategy: `host:${selector}` };",
+            "      }",
+            "    }",
+            "    let parent = item.node.parentElement;",
+            "    while (parent) {",
+            "      if ([\"SPAN\", \"BUTTON\", \"A\"].includes(parent.tagName)) {",
+            "        parent.click();",
+            "        return { ok: true, strategy: `ancestor:${parent.tagName.toLowerCase()}` };",
+            "      }",
+            "      parent = parent.parentElement;",
+            "    }",
+            "  }",
+            "  return { ok: false, reason: 'resume-download-trigger-not-found' };",
+            "})()",
+        ]
+    )
+
+
+def thread_view_matches_candidate(parsed: dict[str, Any], candidate_name: str) -> bool:
+    expected = normalize_text(candidate_name).strip()
+    if not expected:
+        return True
+    active_name = normalize_text(str(parsed.get("candidate", {}).get("candidate_name", "")).strip())
+    if active_name and active_name == expected:
+        return True
+    detail_visible_text = normalize_text(str(parsed.get("detail_visible_text", "")).strip())
+    return bool(detail_visible_text and expected in detail_visible_text)
+
+
+def validate_resume_workflow(parsed: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+    resume_workflow = parsed.get("resume_workflow", {})
+    if not parsed.get("candidate", {}).get("has_resume"):
+        return "resume_not_available", ["当前会话中未检测到可处理的附件简历。"], []
+
+    missing_steps = [str(step) for step in resume_workflow.get("missing_required_steps", [])]
+    if not missing_steps:
+        return "resume_ready", [], []
+
+    messages = {
+        "resume_accept": "当前会话中缺少可点击的“同意接收附件简历”入口。",
+    }
+    return "resume_step_missing", [messages.get(step, f"缺少简历步骤：{step}") for step in missing_steps], missing_steps
+
+
+def build_resume_download_actions(config: dict[str, Any], parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    resume_workflow = parsed["resume_workflow"]
+    download_timeout_ms = int(config["boss"]["download_timeout_seconds"]) * 1000
+    preview_modal_selectors = list(resume_workflow["preview_modal"]["selectors"])
+    download_icon_selectors = list(resume_workflow["download_trigger"]["icon_selectors"])
+    close_block = {"refs": [], "selectors": resume_workflow["close_button"]["selectors"]}
+    return [
+        build_click_action("点击同意接收附件简历", resume_workflow["accept_button"], target_type="resume_accept"),
+        build_wait_action(
+            "等待附件简历卡片进入可预览状态",
+            selector=resume_workflow["preview_button"]["selectors"][0],
+            selectors=resume_workflow["preview_button"]["selectors"],
+            timeout_ms=download_timeout_ms,
+            error_message="同意附件简历后，未出现可预览的简历卡片。",
+        ),
+        build_click_action("打开附件简历预览", resume_workflow["preview_button"], target_type="resume_preview"),
+        build_wait_action(
+            "等待简历预览弹层出现",
+            selector=preview_modal_selectors[0],
+            selectors=dedupe_strings(preview_modal_selectors + download_icon_selectors),
+            timeout_ms=download_timeout_ms,
+            error_message="未成功打开附件简历预览弹层。",
+        ),
+        build_evaluate_action(
+            "触发附件简历下载",
+            build_resume_download_script(config),
+            timeout_ms=download_timeout_ms,
+            error_message="未找到可点击的附件简历下载按钮宿主节点。",
+        ),
+        build_wait_action("等待浏览器接管简历下载", seconds=1.0, timeout_ms=1000),
+        build_click_action("关闭简历预览弹层", close_block, target_type="resume_preview_close"),
+    ]
 
 
 def build_llm_reply_request(config: dict[str, Any], candidate: dict[str, Any], thread_key: str) -> dict[str, Any]:
@@ -299,6 +484,7 @@ def build_llm_reply_request(config: dict[str, Any], candidate: dict[str, Any], t
 
 
 def build_plan_actions(
+    config: dict[str, Any],
     parsed: dict[str, Any],
     reply_text: str,
     thread_id: str,
@@ -312,7 +498,6 @@ def build_plan_actions(
     post_actions: list[dict[str, Any]] = []
 
     input_target = choose_browser_target(parsed["reply_input"])
-    send_target = choose_browser_target(parsed["send_button"])
 
     browser_actions.append(
         {
@@ -332,20 +517,7 @@ def build_plan_actions(
     )
 
     if allow_send:
-        browser_actions.append(
-            {
-                "executor": "browser",
-                "kind": "click",
-                "description": "点击发送按钮",
-                "target_type": "send_button",
-                "target_preference": "selector_first",
-                "ref": "",
-                "fallback_refs": send_target["refs"],
-                "selector": PRIMARY_SEND_SELECTOR,
-                "selectors": send_target["selectors"],
-                "label": send_target["label"],
-            }
-        )
+        browser_actions.append(build_click_action("点击发送按钮", parsed["send_button"], target_type="send_button", primary_selector=PRIMARY_SEND_SELECTOR))
         post_actions.append(
             {
                 "executor": "skill",
@@ -359,22 +531,10 @@ def build_plan_actions(
             }
         )
 
-    if include_resume and parsed["resume_targets"]:
-        resume_target = parsed["resume_targets"][0]
-        selectors = resume_target.get("selectors", [])
-        browser_actions.append(
-            {
-                "executor": "browser",
-                "kind": "click",
-                "description": "触发简历下载",
-                "ref": resume_target.get("ref", ""),
-                "selector": selectors[0] if selectors else "",
-                "selectors": selectors,
-                "label": resume_target.get("label", ""),
-            }
-        )
+    if include_resume:
+        browser_actions.extend(build_resume_download_actions(config, parsed))
 
-    action = "reply_and_download_ready" if include_resume and parsed["resume_targets"] else "reply_ready"
+    action = "reply_and_download_ready" if include_resume and parsed["candidate"].get("has_resume") and allow_send else "reply_ready"
     if not allow_send:
         action = "draft_ready"
 
@@ -386,8 +546,9 @@ def build_plan_actions(
         "job_family": job_family,
         "browser_actions": browser_actions,
         "post_actions": post_actions,
-        "download_expected": bool(parsed["resume_targets"]),
+        "download_expected": bool(include_resume and parsed["candidate"].get("has_resume")),
         "resume_targets": parsed["resume_targets"],
+        "resume_workflow": parsed.get("resume_workflow", {}),
     }
 
 
@@ -404,50 +565,86 @@ def command_plan_next_action(
     if session_result != "session_ok":
         return emit("plan-next-action", session_result, {"session": session_data, "parsed": parsed})
 
+    original_requested_name = str(target_candidate_name or "").strip()
+    requested_name = original_requested_name
+    thread_refs = parsed["thread_refs"]
+    auto_selected_thread: dict[str, Any] | None = None
+
+    if not requested_name:
+        unread_threads = [item for item in thread_refs if item.get("has_unread")]
+        if not unread_threads:
+            if parsed["page_kind"] == "chat_empty":
+                return emit("plan-next-action", "wait_for_candidates", {"parsed": parsed})
+            return emit(
+                "plan-next-action",
+                "wait_for_unread",
+                {
+                    "parsed": parsed,
+                    "available_threads": [item.get("label", "") for item in thread_refs],
+                },
+            )
+        auto_selected_thread = unread_threads[0]
+        requested_name = str(auto_selected_thread.get("label", "")).strip()
+
     page_kind = parsed["page_kind"]
     if page_kind == "chat_empty":
         return emit("plan-next-action", "wait_for_candidates", {"parsed": parsed})
 
     if page_kind == "chat_list":
-        thread_refs = parsed["thread_refs"]
-        if not thread_refs:
+        if not thread_refs and not requested_name:
             return emit("plan-next-action", "wait_for_candidates", {"parsed": parsed})
 
-        selected_thread = thread_refs[0]
-        requested_name = str(target_candidate_name or "").strip()
-        if requested_name:
-            matched = next(
+        selected_thread = auto_selected_thread
+        if requested_name and not selected_thread:
+            selected_thread = next(
                 (item for item in thread_refs if str(item.get("label", "")).strip() == requested_name),
                 None,
             )
-            if not matched:
-                return emit(
-                    "plan-next-action",
-                    "thread_not_found",
-                    {
-                        "target_candidate_name": requested_name,
-                        "available_threads": [item.get("label", "") for item in thread_refs],
-                        "parsed": parsed,
-                    },
-                )
-            selected_thread = matched
 
-        open_thread_action = build_open_thread_action(
-            selected_thread,
-            requested_name or str(selected_thread.get("label", "")),
-        )
+        if selected_thread is None and not requested_name:
+            return emit("plan-next-action", "wait_for_candidates", {"parsed": parsed})
+
+        candidate_name = requested_name or str(selected_thread.get("label", ""))
+        open_thread_actions = build_open_thread_action(config, selected_thread, candidate_name)
         return emit(
             "plan-next-action",
             "open_thread",
             {
                 "parsed": parsed,
-                "target_candidate_name": open_thread_action["candidate_name"],
-                "browser_actions": [open_thread_action],
+                "target_candidate_name": candidate_name,
+                "match_strategy": "snapshot_ref" if selected_thread else "dom_search",
+                "available_threads": [item.get("label", "") for item in thread_refs],
+                "browser_actions": open_thread_actions,
             },
         )
 
     if page_kind != "thread_view":
         return emit("plan-next-action", "unknown_page", {"parsed": parsed})
+
+    if requested_name and not thread_view_matches_candidate(parsed, requested_name):
+        if auto_selected_thread is not None:
+            return emit(
+                "plan-next-action",
+                "open_thread",
+                {
+                    "parsed": parsed,
+                    "target_candidate_name": requested_name,
+                    "match_strategy": "snapshot_ref" if auto_selected_thread else "dom_search",
+                    "available_threads": [item.get("label", "") for item in thread_refs],
+                    "browser_actions": build_open_thread_action(config, auto_selected_thread, requested_name),
+                },
+            )
+        return emit(
+            "plan-next-action",
+            "thread_not_found",
+            {
+                "target_candidate_name": requested_name,
+                "active_candidate_name": parsed["candidate"].get("candidate_name", ""),
+                "parsed": parsed,
+            },
+            [f"打开会话后未确认进入候选人“{requested_name}”的聊天详情。"],
+            ok=False,
+        )
 
     candidate = merge_candidate(config, parsed["candidate"], candidate_override)
     resolved_thread_id = derive_thread_key(candidate, thread_id)
@@ -485,8 +682,20 @@ def command_finalize_reply_plan(
     except ValueError as exc:
         return emit("finalize-reply-plan", "reply_result_invalid", {}, [str(exc)], ok=False)
 
+    if include_resume:
+        resume_action, resume_errors, missing_steps = validate_resume_workflow(parsed)
+        if resume_errors:
+            return emit(
+                "finalize-reply-plan",
+                resume_action,
+                {"parsed": parsed, "missing_steps": missing_steps},
+                resume_errors,
+                ok=False,
+            )
+
     family = choose_job_family(str(candidate.get("job_title", "")), config["job_families"])
     action, data = build_plan_actions(
+        config,
         parsed,
         normalized["reply_text"],
         resolved_thread_id,

@@ -5,8 +5,9 @@
 当前主链路固定为：
 
 1. `plan-next-action`
-2. `llm-task`
-3. `finalize-reply-plan`
+2. 如果返回 `wait_for_unread`，本轮结束
+3. `llm-task`
+4. `finalize-reply-plan`
 
 ## 支持命令
 
@@ -39,6 +40,7 @@
 可能返回：
 
 - `wait_for_candidates`
+- `wait_for_unread`
 - `open_thread`
 - `thread_not_found`
 - `llm_reply_required`
@@ -47,7 +49,11 @@
 
 ### `open_thread`
 
-`data.browser_actions` 是浏览器执行动作。优先按返回的 `selector` / `selectors` 点击，不要在外层自己重写点击逻辑。
+`data.browser_actions` 是浏览器执行动作。打开会话时优先执行返回的 `evaluate` 动作，不要在外层自己改写为坐标点击或手工 selector 轮询。
+
+### `wait_for_unread`
+
+当前会话列表中没有识别到未读会话，本轮轮询应直接结束，不要继续生成回复。
 
 ### `llm_reply_required`
 
@@ -107,10 +113,30 @@ Runner 必须直接调用 `llm_task_request`，不要自己重写 prompt。
 }
 ```
 
+```json
+{
+  "executor": "browser",
+  "kind": "evaluate",
+  "script": "(() => { /* page JS */ })()"
+}
+```
+
+```json
+{
+  "executor": "browser",
+  "kind": "wait",
+  "selector": ".boss-popup",
+  "timeout_ms": 30000
+}
+```
+
 规则：
 
+- 不需要先指定“当前候选人”；默认按未读会话轮询
 - 输入框优先使用 `#boss-chat-editor-input`
 - 发送按钮优先使用 `div.submit.active`
+- 会话打开优先使用 `evaluate` 精确点击目标候选人的外层会话容器
+- 简历下载动作链固定为：同意 -> 预览 -> 下载 -> 关闭预览
 - 按 `browser_actions` 顺序执行
 - `post_actions` 只在浏览器动作成功后执行
 
