@@ -29,7 +29,6 @@ conversation_filter_labels = ["全部", "未读", "新招呼", "仅沟通", "更
 ignored_thread_labels = ["BOSS直聘", "首页", "职位", "公司", "校园", "海归", "APP", "有了", "海外", "无障碍专区", "在线客服", "消息", "简历", "查看职位", "更新简历"]
 thread_item_container_selectors = ["[role='listitem']", "li", ".chat-item", ".dialog-item", ".item-friend", ".friend-item", ".geek-item"]
 thread_item_clickable_ancestor_selectors = ["a", "button", "[role='button']", "[role='link']", "[role='listitem']", "li", ".chat-item", ".dialog-item", ".item-friend", ".friend-item", ".geek-item"]
-thread_open_verification_texts = ["发送", "请输入消息", "最近消息", "职位", "姓名"]
 send_button_texts = ["发送"]
 reply_input_selectors = ["#boss-chat-editor-input", "textarea", "[contenteditable='true']"]
 send_button_selectors = ["div.submit.active", "button[type='submit']"]
@@ -38,11 +37,7 @@ no_contacts_texts = ["30天内暂无联系人"]
 no_message_texts = ["当前暂无消息"]
 
 [storage]
-download_root = "C:/BossHR/downloads"
-archive_root = "C:/BossHR/resumes"
-message_log_root = "C:/BossHR/logs"
-resume_name_pattern = "{job_title}_{candidate_name}_{delivery_time}"
-delivery_time_format = "%Y-%m-%d-%H%M"
+download_root = "/data/openclaw/skills/boss-hr-assistant/runtime/downloads"
 
 [download_resolution]
 extensions = [".pdf", ".doc", ".docx"]
@@ -51,29 +46,12 @@ min_size_bytes = 1
 stability_window_seconds = 1
 
 [state]
-state_root = "C:/BossHR/state"
-state_file = "C:/BossHR/state/runtime-state.json"
-reply_log_file = "C:/BossHR/state/reply-log.jsonl"
-resume_log_file = "C:/BossHR/state/resume-log.jsonl"
-reply_cooldown_minutes = 720
+state_file = "/data/openclaw/skills/boss-hr-assistant/runtime/state/runtime-state.json"
+reply_log_file = "/data/openclaw/skills/boss-hr-assistant/runtime/state/reply-log.jsonl"
 
 [reply]
 default_company_name = "广州浩传网络科技有限公司"
-default_signoff = "方便的话直接回复我，我会尽快安排后续沟通。"
 max_recent_messages = 4
-manual_review_keywords = [
-  "薪资保密",
-  "股权",
-  "仲裁",
-  "投诉",
-  "举报",
-  "猎头",
-  "外包",
-  "兼职",
-  "实习证明",
-  "offer",
-  "背调"
-]
 resume_trigger_keywords = [
   "已投递简历",
   "附件",
@@ -84,68 +62,30 @@ resume_trigger_keywords = [
   ".doc",
   ".docx"
 ]
-self_intro_keywords = [
-  "我有",
-  "我做过",
-  "负责过",
-  "项目经验",
-  "工作了",
-  "目前在职",
-  "最近在看机会"
-]
+
+[llm_reply]
+tool_name = "llm-task"
+thinking = "low"
+max_tokens = 800
+temperature = 0.2
+timeout_ms = 30000
 
 [[job_families]]
 name = "java-backend"
 title_keywords = ["java", "后端", "backend", "spring", "微服务"]
 screening_questions = ["目前所在城市", "后端相关经验年限", "熟悉的技术栈", "到岗时间"]
-template_first_contact = """
-你好，我是{company_name}的HR，看到你投递了{job_title}。想先和你确认几个信息：{questions}。{signoff}
-"""
-template_after_intro = """
-收到，感谢你的介绍。你投递的是{job_title}，我会结合你的项目经历进一步评估。也想再确认一下：{questions}。如果方便，也可以补充最近做过的代表项目。{signoff}
-"""
-template_follow_up = """
-你好，这边继续跟进一下{job_title}岗位。为了推进后续安排，麻烦补充：{questions}。{signoff}
-"""
 
 [[job_families]]
 name = "sales"
 title_keywords = ["销售", "招商主管", "bd", "business development", "客户经理"]
 screening_questions = ["目前所在城市", "近两年的销售类型或行业", "最近一份工作的业绩情况", "到岗时间"]
-template_first_contact = """
-你好，我是{company_name}的HR，看到你投递了{job_title}。想先了解几个关键信息：{questions}。{signoff}
-"""
-template_after_intro = """
-收到，感谢你的介绍。你投递的是{job_title}，我会结合你的行业经验和业务经历进一步评估。也请补充一下：{questions}。{signoff}
-"""
-template_follow_up = """
-你好，这边继续跟进{job_title}岗位。为了推进沟通，请补充：{questions}。{signoff}
-"""
 
 [[job_families]]
 name = "operations"
 title_keywords = ["运营", "内容", "用户运营", "活动运营", "社群"]
 screening_questions = ["目前所在城市", "做过的运营方向", "最近负责过的项目", "到岗时间"]
-template_first_contact = """
-你好，我是{company_name}的HR，看到你投递了{job_title}。想先确认几个信息：{questions}。{signoff}
-"""
-template_after_intro = """
-收到，感谢你的介绍。你投递的是{job_title}，我会结合你的项目经历进一步评估。也麻烦补充：{questions}。如果方便，也可以附上代表性的项目或作品说明。{signoff}
-"""
-template_follow_up = """
-你好，这边继续跟进{job_title}岗位。为了推进后续安排，请补充：{questions}。{signoff}
-"""
 
 [[job_families]]
 name = "generic"
 title_keywords = []
 screening_questions = ["目前所在城市", "相关经验年限", "到岗时间"]
-template_first_contact = """
-你好，我是{company_name}的HR，看到你投递了{job_title}。想先和你确认几个信息：{questions}。{signoff}
-"""
-template_after_intro = """
-收到，感谢你的介绍。你投递的是{job_title}，我会结合你的经历进一步评估。也想再确认一下：{questions}。{signoff}
-"""
-template_follow_up = """
-你好，这边继续跟进{job_title}岗位。为了推进后续安排，麻烦补充：{questions}。{signoff}
-"""

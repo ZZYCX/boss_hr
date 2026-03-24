@@ -322,7 +322,10 @@ def extract_recent_messages(lines: list[str], config: dict[str, Any]) -> list[di
             continue
         seen.add(text)
         deduped.append(message)
-    return deduped[-3:]
+    max_recent_messages = int(config.get("reply", {}).get("max_recent_messages", 3))
+    if max_recent_messages <= 0:
+        max_recent_messages = 3
+    return deduped[-max_recent_messages:]
 
 
 def find_reply_input_targets(nodes: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:

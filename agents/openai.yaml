@@ -1,4 +1,4 @@
 interface:
   display_name: "Boss HR Assistant"
-  short_description: "通过 OpenClaw Browser Relay 接管 Boss 会话并处理候选人沟通。"
-  default_prompt: "Use $boss-hr-assistant with OpenClaw Browser Relay to find the logged-in Boss tab, snapshot the page, run boss_hr.py plan-next-action, execute returned browser_actions, run post_actions after confirmed sends, resolve downloaded resumes, and rename/archive them."
+  short_description: "通过 llm-task 生成候选人回复，再驱动 Boss 页面发送与简历下载。"
+  default_prompt: "Use $boss-hr-assistant on the current logged-in Boss chat tab. Run boss_hr.py session-check, then boss_hr.py plan-next-action. If the action is open_thread, execute the returned browser_actions and resnapshot. If the action is llm_reply_required, call the returned llm_task_request directly, then run boss_hr.py finalize-reply-plan with the structured llm-task result and execute the returned browser_actions and post_actions. Keep #boss-chat-editor-input as the primary editor selector and div.submit.active as the primary send selector. For resume files, only trigger browser download and optionally use resolve-download to inspect the newest stable file."

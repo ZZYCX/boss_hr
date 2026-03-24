@@ -12,14 +12,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from llm_reply import build_candidate_payload, build_llm_task, load_json_arg, normalize_llm_result
 from parse_boss_snapshot import load_snapshot_text, parse_snapshot
-from render_reply import build_reply, choose_job_family, detect_manual_review, infer_stage
-from rename_resume import normalize_delivery_time, pick_destination, sanitize_segment
 from resolve_download import parse_known_files, resolve_download
 from validate_config import load_toml, validate_config
 
 
 STATE_VERSION = 1
+PRIMARY_EDITOR_SELECTOR = "#boss-chat-editor-input"
+PRIMARY_SEND_SELECTOR = "div.submit.active"
 
 
 def utc_now() -> str:
@@ -53,21 +54,12 @@ def read_text_arg(raw_text: str | None, text_file: str | None) -> str:
     return ""
 
 
-def load_candidate(candidate_json: str | None, candidate_file: str | None) -> dict[str, Any]:
-    if candidate_json:
-        return json.loads(candidate_json)
-    if candidate_file:
-        with Path(candidate_file).open("r", encoding="utf-8-sig") as fh:
-            return json.load(fh)
-    raise ValueError("Provide --candidate-json or --candidate-file.")
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def default_state() -> dict[str, Any]:
     return {"version": STATE_VERSION, "session": {}, "threads": {}}
-
-
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -97,27 +89,35 @@ def normalize_text(value: str) -> str:
     return value.casefold()
 
 
+def latest_message_text(candidate: dict[str, Any]) -> str:
+    messages = candidate.get("recent_messages", [])
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        text = str(message.get("text", "")).strip()
+        if text:
+            return text
+    return ""
+
+
 def derive_thread_key(candidate: dict[str, Any], thread_id: str | None) -> str:
     if thread_id:
         return thread_id
-    parts = [
-        str(candidate.get("candidate_name", "")),
-        str(candidate.get("job_title", "")),
-        str(candidate.get("delivery_time", "")),
-    ]
-    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+    seed = json.dumps(
+        {
+            "candidate_name": candidate.get("candidate_name", ""),
+            "job_title": candidate.get("job_title", ""),
+            "delivery_time": candidate.get("delivery_time", ""),
+            "latest_message": latest_message_text(candidate),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"thread_{digest}"
-
-
-def message_fingerprint(candidate: dict[str, Any], stage: str) -> str:
-    messages = candidate.get("recent_messages", [])
-    serial = json.dumps(messages, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(f"{stage}|{serial}".encode("utf-8")).hexdigest()
-
-
-def build_resume_key(job_title: str, candidate_name: str, delivery_time: str, ext: str) -> str:
-    raw = "|".join((job_title, candidate_name, delivery_time, ext.lower()))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def status_list(record: dict[str, Any]) -> list[str]:
@@ -128,37 +128,45 @@ def status_list(record: dict[str, Any]) -> list[str]:
 
 
 def upsert_status(record: dict[str, Any], status: str) -> None:
-    current = status_list(record)
-    if status not in current:
-        current.append(status)
-    record["statuses"] = current
+    statuses = status_list(record)
+    if status not in statuses:
+        statuses.append(status)
+    record["statuses"] = statuses
 
 
-def merge_candidate(snapshot_candidate: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
-    candidate = dict(snapshot_candidate)
+def choose_job_family(job_title: str, families: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_title = normalize_text(job_title)
+    generic_family: dict[str, Any] = {"name": "generic", "screening_questions": []}
+
+    for family in families:
+        if not isinstance(family, dict):
+            continue
+        keywords = family.get("title_keywords", [])
+        if not keywords:
+            generic_family = family
+            continue
+        for keyword in keywords:
+            if normalize_text(str(keyword)) in normalized_title:
+                return family
+
+    return generic_family
+
+
+def merge_candidate(
+    config: dict[str, Any],
+    snapshot_candidate: dict[str, Any],
+    override: dict[str, Any] | None,
+) -> dict[str, Any]:
+    candidate = build_candidate_payload(snapshot_candidate, config["reply"]["default_company_name"])
     if not override:
         return candidate
 
     for key, value in override.items():
-        if key == "recent_messages":
-            if isinstance(value, list) and value:
-                candidate[key] = value
+        if value in ("", None, [], {}):
             continue
-        if value not in ("", None, [], {}):
-            candidate[key] = value
-    return candidate
+        candidate[key] = value
 
-
-def command_validate_config(config: dict[str, Any]) -> int:
-    errors = validate_config(config)
-    if errors:
-        return emit("validate-config", "invalid_config", {}, errors, ok=False)
-    data = {
-        "job_family_count": len(config["job_families"]),
-        "archive_root": config["storage"]["archive_root"],
-        "state_file": config["state"]["state_file"],
-    }
-    return emit("validate-config", "config_valid", data)
+    return build_candidate_payload(candidate, config["reply"]["default_company_name"])
 
 
 def session_action(config: dict[str, Any], current_url: str, page_text: str) -> tuple[str, dict[str, Any]]:
@@ -192,6 +200,19 @@ def session_action(config: dict[str, Any], current_url: str, page_text: str) -> 
     return "session_ok", data
 
 
+def command_validate_config(config: dict[str, Any]) -> int:
+    errors = validate_config(config)
+    if errors:
+        return emit("validate-config", "invalid_config", {}, errors, ok=False)
+    data = {
+        "job_family_count": len(config["job_families"]),
+        "download_root": config["storage"]["download_root"],
+        "state_file": config["state"]["state_file"],
+        "llm_tool": config["llm_reply"]["tool_name"],
+    }
+    return emit("validate-config", "config_valid", data)
+
+
 def command_session_check(config: dict[str, Any], current_url: str, page_text: str, write_state: bool) -> int:
     action, data = session_action(config, current_url, page_text)
     if write_state:
@@ -205,270 +226,6 @@ def command_session_check(config: dict[str, Any], current_url: str, page_text: s
 def command_parse_snapshot(config: dict[str, Any], current_url: str, snapshot_text: str) -> int:
     parsed = parse_snapshot(config, current_url, snapshot_text)
     return emit("parse-snapshot", "snapshot_parsed", parsed)
-
-
-def evaluate_draft_reply(
-    config: dict[str, Any],
-    candidate: dict[str, Any],
-    thread_id: str | None,
-    write_state: bool,
-    force: bool,
-) -> tuple[str, dict[str, Any]]:
-    state_path = path_from_config(config, "state", "state_file")
-    state = load_state(state_path) if write_state else default_state()
-    thread_key = derive_thread_key(candidate, thread_id)
-    thread_record = state["threads"].get(thread_key, {})
-
-    reply_config = config["reply"]
-    stage = infer_stage(candidate, reply_config)
-    fingerprint = message_fingerprint(candidate, stage)
-    previous_fingerprint = thread_record.get("last_message_fingerprint")
-    previous_action = thread_record.get("last_reply_action")
-
-    if not force and previous_fingerprint == fingerprint and previous_action in {"reply", "manual_review"}:
-        return (
-            "skip_duplicate",
-            {
-                "thread_id": thread_key,
-                "candidate_name": candidate.get("candidate_name", ""),
-                "job_title": candidate.get("job_title", ""),
-                "previous_action": previous_action,
-            },
-        )
-
-    reason = detect_manual_review(candidate, reply_config)
-    if reason:
-        data = {
-            "thread_id": thread_key,
-            "candidate_name": candidate.get("candidate_name", ""),
-            "job_title": candidate.get("job_title", ""),
-            "stage": stage,
-            "reason": reason,
-        }
-        if write_state:
-            record = {
-                **thread_record,
-                "candidate_name": candidate.get("candidate_name", ""),
-                "job_title": candidate.get("job_title", ""),
-                "delivery_time": candidate.get("delivery_time", ""),
-                "last_message_fingerprint": fingerprint,
-                "last_reply_action": "manual_review",
-                "last_reply_at": utc_now(),
-                "updated_at": utc_now(),
-            }
-            upsert_status(record, "manual_review")
-            state["threads"][thread_key] = record
-            save_state(state_path, state)
-            append_jsonl(
-                path_from_config(config, "state", "reply_log_file"),
-                {
-                    "thread_id": thread_key,
-                    "candidate_name": candidate.get("candidate_name", ""),
-                    "job_title": candidate.get("job_title", ""),
-                    "action": "manual_review",
-                    "reason": reason,
-                    "timestamp": utc_now(),
-                },
-            )
-        return "manual_review", data
-
-    family = choose_job_family(str(candidate["job_title"]), config["job_families"])
-    reply_text = build_reply(candidate, family, reply_config, stage)
-    data = {
-        "thread_id": thread_key,
-        "stage": stage,
-        "job_family": family["name"],
-        "candidate_name": candidate["candidate_name"],
-        "job_title": candidate["job_title"],
-        "reply": reply_text,
-    }
-
-    if write_state:
-        record = {
-            **thread_record,
-            "candidate_name": candidate.get("candidate_name", ""),
-            "job_title": candidate.get("job_title", ""),
-            "delivery_time": candidate.get("delivery_time", ""),
-            "last_message_fingerprint": fingerprint,
-            "last_reply_action": "reply",
-            "last_reply_text": reply_text,
-            "last_reply_at": utc_now(),
-            "updated_at": utc_now(),
-        }
-        upsert_status(record, "drafted")
-        state["threads"][thread_key] = record
-        save_state(state_path, state)
-        append_jsonl(
-            path_from_config(config, "state", "reply_log_file"),
-            {
-                "thread_id": thread_key,
-                "candidate_name": candidate.get("candidate_name", ""),
-                "job_title": candidate.get("job_title", ""),
-                "action": "reply",
-                "stage": stage,
-                "timestamp": utc_now(),
-            },
-        )
-
-    return "reply", data
-
-
-def command_draft_reply(
-    config: dict[str, Any],
-    candidate: dict[str, Any],
-    thread_id: str | None,
-    write_state: bool,
-    force: bool,
-) -> int:
-    action, data = evaluate_draft_reply(config, candidate, thread_id, write_state, force)
-    return emit("draft-reply", action, data)
-
-
-def command_mark_thread(
-    config: dict[str, Any],
-    thread_id: str,
-    status: str,
-    candidate_name: str | None,
-    job_title: str | None,
-    note: str | None,
-) -> int:
-    state_path = path_from_config(config, "state", "state_file")
-    state = load_state(state_path)
-    record = state["threads"].get(thread_id, {})
-
-    if candidate_name:
-        record["candidate_name"] = candidate_name
-    if job_title:
-        record["job_title"] = job_title
-    if note:
-        record["note"] = note
-    record["updated_at"] = utc_now()
-    upsert_status(record, status)
-
-    state["threads"][thread_id] = record
-    save_state(state_path, state)
-    return emit("mark-thread", "state_updated", {"thread_id": thread_id, "status": status})
-
-
-def command_show_state(config: dict[str, Any], thread_id: str | None) -> int:
-    state_path = path_from_config(config, "state", "state_file")
-    state = load_state(state_path)
-    if thread_id:
-        data = {"thread_id": thread_id, "thread": state.get("threads", {}).get(thread_id)}
-    else:
-        data = state
-    return emit("show-state", "state_loaded", data)
-
-
-def plan_resume_destination(
-    config: dict[str, Any],
-    source: Path,
-    job_title: str,
-    candidate_name: str,
-    delivery_time: str,
-) -> tuple[Path, str]:
-    storage = config["storage"]
-    payload = {
-        "job_title": sanitize_segment(job_title),
-        "candidate_name": sanitize_segment(candidate_name),
-        "delivery_time": normalize_delivery_time(delivery_time, storage["delivery_time_format"]),
-    }
-    filename = storage["resume_name_pattern"].format(**payload) + source.suffix.lower()
-    return pick_destination(Path(storage["archive_root"]) / filename), payload["delivery_time"]
-
-
-def command_rename_resume(
-    config: dict[str, Any],
-    source: str,
-    job_title: str,
-    candidate_name: str,
-    delivery_time: str,
-    thread_id: str | None,
-    write_state: bool,
-    force: bool,
-    copy: bool,
-    dry_run: bool,
-) -> int:
-    source_path = Path(source)
-    if not source_path.exists():
-        return emit("rename-resume", "source_missing", {}, [f"Source file not found: {source_path}"], ok=False)
-
-    target_path, normalized_time = plan_resume_destination(config, source_path, job_title, candidate_name, delivery_time)
-    key = build_resume_key(job_title, candidate_name, normalized_time, source_path.suffix)
-    fallback_id = hashlib.sha256(f"{job_title}|{candidate_name}|{normalized_time}".encode("utf-8")).hexdigest()[:16]
-    thread_key = thread_id or f"resume_{fallback_id}"
-
-    if write_state:
-        state_path = path_from_config(config, "state", "state_file")
-        state = load_state(state_path)
-        record = state["threads"].get(thread_key, {})
-        existing_keys = record.get("resume_keys", [])
-        if not force and key in existing_keys:
-            return emit(
-                "rename-resume",
-                "skip_duplicate",
-                {
-                    "thread_id": thread_key,
-                    "candidate_name": candidate_name,
-                    "job_title": job_title,
-                    "delivery_time": normalized_time,
-                },
-            )
-    else:
-        state_path = path_from_config(config, "state", "state_file")
-        state = default_state()
-
-    if not dry_run:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if copy:
-            from shutil import copy2
-
-            copy2(source_path, target_path)
-        else:
-            from shutil import move
-
-            move(str(source_path), target_path)
-
-    data = {
-        "thread_id": thread_key,
-        "candidate_name": candidate_name,
-        "job_title": job_title,
-        "delivery_time": normalized_time,
-        "target_path": str(target_path),
-        "copied": copy,
-        "dry_run": dry_run,
-    }
-
-    if write_state:
-        record = state["threads"].get(thread_key, {})
-        record["candidate_name"] = candidate_name
-        record["job_title"] = job_title
-        record["delivery_time"] = delivery_time
-        record["updated_at"] = utc_now()
-        resume_keys = record.get("resume_keys", [])
-        if key not in resume_keys:
-            resume_keys.append(key)
-        record["resume_keys"] = resume_keys
-        resume_files = record.get("resume_files", [])
-        if str(target_path) not in resume_files:
-            resume_files.append(str(target_path))
-        record["resume_files"] = resume_files
-        upsert_status(record, "resume_downloaded")
-        state["threads"][thread_key] = record
-        save_state(state_path, state)
-        append_jsonl(
-            path_from_config(config, "state", "resume_log_file"),
-            {
-                "thread_id": thread_key,
-                "candidate_name": candidate_name,
-                "job_title": job_title,
-                "action": "renamed" if not dry_run else "dry_run",
-                "target_path": str(target_path),
-                "timestamp": utc_now(),
-            },
-        )
-
-    return emit("rename-resume", "renamed" if not dry_run else "dry_run", data)
 
 
 def choose_browser_target(target_block: dict[str, Any]) -> dict[str, Any]:
@@ -485,38 +242,8 @@ def choose_browser_target(target_block: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_name(value: str) -> str:
-    return "".join(value.casefold().split())
-
-
-def candidate_name_matches(expected_name: str, observed_name: str) -> bool:
-    if not expected_name or not observed_name:
-        return False
-    expected = normalize_name(expected_name)
-    observed = normalize_name(observed_name)
-    return expected == observed or expected in observed or observed in expected
-
-
-def build_thread_verification(config: dict[str, Any], candidate_name: str) -> dict[str, Any]:
-    return {
-        "requires_resnapshot": True,
-        "command": "verify-thread-open",
-        "candidate_name": candidate_name,
-        "expected_page_kind": "thread_view",
-        "success_action": "thread_verified",
-        "retry_action": "try_next_fallback",
-        "required_keywords": config["browser_actions"]["thread_open_verification_texts"],
-    }
-
-
-def build_open_thread_action(
-    config: dict[str, Any],
-    thread_target: dict[str, Any],
-    candidate_name: str,
-) -> dict[str, Any]:
+def build_open_thread_action(thread_target: dict[str, Any], candidate_name: str) -> dict[str, Any]:
     selectors = thread_target.get("selector_candidates", [])
-    js_click_fallback = thread_target.get("js_click_fallback", "")
-    verification = build_thread_verification(config, candidate_name)
     return {
         "executor": "browser",
         "kind": "click",
@@ -536,114 +263,73 @@ def build_open_thread_action(
         "fallback_clicks": [
             {
                 "method": "selector",
-                "description": "优先点击包含候选人姓名的对话项外层可点击容器。",
+                "description": "优先点击对话项外层可点击容器。",
                 "selectors": selectors,
             },
             {
                 "method": "ref",
-                "description": "若容器 selector 失败，再尝试 snapshot 提供的线程 ref。",
+                "description": "如果容器 selector 失败，再尝试 snapshot ref。",
                 "ref": thread_target.get("ref", ""),
             },
             {
                 "method": "javascript",
-                "description": "若 selector 仍失败，执行 JavaScript 向上查找可点击父节点后 click。",
-                "script": js_click_fallback,
+                "description": "最后执行页面内的回退点击脚本。",
+                "script": thread_target.get("js_click_fallback", ""),
             },
         ],
-        "verification": verification,
     }
 
 
-def build_input_verification_script(expected_text: str) -> str:
-    lines = [line.strip() for line in expected_text.splitlines() if line.strip()]
-    return "\n".join(
-        [
-            "(() => {",
-            f"  const selector = {json.dumps('#boss-chat-editor-input', ensure_ascii=False)};",
-            f"  const expectedLines = {json.dumps(lines, ensure_ascii=False)};",
-            "  const el = document.querySelector(selector);",
-            "  if (!el) return { ok: false, reason: 'input-not-found' };",
-            '  const text = ((el.innerText || el.value || el.textContent || "")).replace(/\\r/g, "").trim();',
-            "  const ok = expectedLines.every((line) => text.includes(line));",
-            "  return { ok, observedText: text, expectedLines };",
-            "})()",
-        ]
-    )
+def build_llm_reply_request(config: dict[str, Any], candidate: dict[str, Any], thread_key: str) -> dict[str, Any]:
+    family = choose_job_family(str(candidate.get("job_title", "")), config["job_families"])
+    llm_input = build_candidate_payload(candidate, config["reply"]["default_company_name"])
+    llm_input["thread_id"] = thread_key
+    llm_input["job_family"] = family.get("name", "generic")
+    llm_input["must_ask"] = list(family.get("screening_questions", []))
 
-
-def build_send_verification_script(expected_text: str) -> str:
-    normalized_expected = " ".join(expected_text.split())
-    return "\n".join(
-        [
-            "(() => {",
-            f"  const expected = {json.dumps(normalized_expected, ensure_ascii=False)};",
-            '  const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();',
-            "  const nodes = Array.from(document.querySelectorAll('body *'));",
-            "  for (const node of nodes) {",
-            "    if (node.matches('#boss-chat-editor-input, #boss-chat-editor-input *')) continue;",
-            "    const text = normalize(node.innerText || node.textContent || '');",
-            "    if (text && text.includes(expected)) {",
-            "      return { ok: true, observedText: text, tagName: node.tagName };",
-            "    }",
-            "  }",
-            "  return { ok: false, reason: 'reply-text-not-found-in-thread' };",
-            "})()",
-        ]
-    )
-
-
-def build_reply_visibility_verification(config: dict[str, Any], candidate_name: str, reply_text: str) -> dict[str, Any]:
     return {
-        "requires_resnapshot": True,
-        "command": "verify-reply-sent",
-        "candidate_name": candidate_name,
-        "expected_reply": reply_text,
-        "required_keywords": config["browser_actions"]["thread_open_verification_texts"],
-        "success_action": "reply_sent",
-        "retry_action": "send_unverified",
+        "thread_id": thread_key,
+        "job_family": family.get("name", "generic"),
+        "candidate_name": candidate.get("candidate_name", ""),
+        "job_title": candidate.get("job_title", ""),
+        "candidate": llm_input,
+        "llm_task_request": build_llm_task(config, llm_input),
+        "next_command": "finalize-reply-plan",
     }
 
 
 def build_plan_actions(
-    config: dict[str, Any],
     parsed: dict[str, Any],
-    reply_data: dict[str, Any],
+    reply_text: str,
+    thread_id: str,
+    stage: str,
+    job_family: str,
     allow_send: bool,
     include_resume: bool,
 ) -> tuple[str, dict[str, Any]]:
     candidate = parsed["candidate"]
-    thread_id = reply_data["thread_id"]
     browser_actions: list[dict[str, Any]] = []
     post_actions: list[dict[str, Any]] = []
 
     input_target = choose_browser_target(parsed["reply_input"])
     send_target = choose_browser_target(parsed["send_button"])
-    input_fallback_refs = input_target["refs"]
-    send_fallback_refs = send_target["refs"]
 
-    if input_target["ref"] or input_target["selector"]:
-        browser_actions.append(
-            {
-                "executor": "browser",
-                "kind": "type",
-                "description": "输入回复内容",
-                "target_type": "chat_input",
-                "target_preference": "selector_first",
-                "ref": "",
-                "fallback_refs": input_fallback_refs,
-                "selector": "#boss-chat-editor-input",
-                "selectors": input_target["selectors"],
-                "text": reply_data["reply"],
-                "html": "<br>".join([line for line in reply_data["reply"].splitlines() if line.strip()]),
-                "dispatch_events": ["input", "change", "blur"],
-                "verification": {
-                    "method": "javascript",
-                    "script": build_input_verification_script(reply_data["reply"]),
-                    "success_action": "input_verified",
-                    "retry_action": "retry_input",
-                },
-            }
-        )
+    browser_actions.append(
+        {
+            "executor": "browser",
+            "kind": "type",
+            "description": "输入回复内容",
+            "target_type": "chat_input",
+            "target_preference": "selector_first",
+            "ref": "",
+            "fallback_refs": input_target["refs"],
+            "selector": PRIMARY_EDITOR_SELECTOR,
+            "selectors": input_target["selectors"],
+            "text": reply_text,
+            "html": "<br>".join(line for line in reply_text.splitlines() if line.strip()),
+            "dispatch_events": ["input", "change", "blur"],
+        }
+    )
 
     if allow_send:
         browser_actions.append(
@@ -654,15 +340,10 @@ def build_plan_actions(
                 "target_type": "send_button",
                 "target_preference": "selector_first",
                 "ref": "",
-                "fallback_refs": send_fallback_refs,
-                "selector": "div.submit.active",
+                "fallback_refs": send_target["refs"],
+                "selector": PRIMARY_SEND_SELECTOR,
                 "selectors": send_target["selectors"],
                 "label": send_target["label"],
-                "verification": {
-                    "method": "javascript",
-                    "script": build_send_verification_script(reply_data["reply"]),
-                    **build_reply_visibility_verification(config, candidate.get("candidate_name", ""), reply_data["reply"]),
-                },
             }
         )
         post_actions.append(
@@ -700,96 +381,14 @@ def build_plan_actions(
     return action, {
         "thread_id": thread_id,
         "candidate": candidate,
-        "reply": reply_data["reply"],
-        "stage": reply_data["stage"],
-        "job_family": reply_data["job_family"],
+        "reply": reply_text,
+        "stage": stage,
+        "job_family": job_family,
         "browser_actions": browser_actions,
         "post_actions": post_actions,
         "download_expected": bool(parsed["resume_targets"]),
         "resume_targets": parsed["resume_targets"],
     }
-
-
-def command_verify_thread_open(
-    config: dict[str, Any],
-    current_url: str,
-    snapshot_text: str,
-    candidate_name: str,
-) -> int:
-    parsed = parse_snapshot(config, current_url, snapshot_text)
-    visible_text = parsed["visible_text"]
-    observed_name = str(parsed["candidate"].get("candidate_name", ""))
-    keyword_hits = [
-        keyword
-        for keyword in config["browser_actions"]["thread_open_verification_texts"]
-        if keyword in visible_text
-    ]
-    name_match = candidate_name_matches(candidate_name, observed_name) or (
-        candidate_name and normalize_text(candidate_name) in normalize_text(visible_text)
-    )
-    has_input_ref = bool(parsed["reply_input"].get("refs"))
-    has_send_ref = bool(parsed["send_button"].get("refs"))
-
-    data = {
-        "expected_candidate_name": candidate_name,
-        "observed_candidate_name": observed_name,
-        "page_kind": parsed["page_kind"],
-        "name_match": name_match,
-        "keyword_hits": keyword_hits,
-        "has_input_ref": has_input_ref,
-        "has_send_ref": has_send_ref,
-        "parsed": parsed,
-    }
-
-    if parsed["page_kind"] == "thread_view" and name_match and (keyword_hits or has_input_ref or has_send_ref):
-        return emit("verify-thread-open", "thread_verified", data)
-    if parsed["page_kind"] == "chat_list":
-        return emit("verify-thread-open", "still_in_list", data)
-    if parsed["page_kind"] == "thread_view":
-        return emit("verify-thread-open", "thread_mismatch", data)
-    return emit("verify-thread-open", "thread_open_uncertain", data)
-
-
-def command_verify_reply_sent(
-    config: dict[str, Any],
-    current_url: str,
-    snapshot_text: str,
-    candidate_name: str,
-    expected_reply: str,
-) -> int:
-    parsed = parse_snapshot(config, current_url, snapshot_text)
-    visible_text = parsed["visible_text"]
-    observed_name = str(parsed["candidate"].get("candidate_name", ""))
-    name_match = candidate_name_matches(candidate_name, observed_name) or (
-        candidate_name and normalize_text(candidate_name) in normalize_text(visible_text)
-    )
-    expected_lines = [line.strip() for line in expected_reply.splitlines() if line.strip()]
-    visible_match = all(line in visible_text for line in expected_lines) if expected_lines else False
-    keyword_hits = [
-        keyword
-        for keyword in config["browser_actions"]["thread_open_verification_texts"]
-        if keyword in visible_text
-    ]
-
-    data = {
-        "expected_candidate_name": candidate_name,
-        "observed_candidate_name": observed_name,
-        "page_kind": parsed["page_kind"],
-        "name_match": name_match,
-        "visible_match": visible_match,
-        "expected_reply": expected_reply,
-        "expected_lines": expected_lines,
-        "keyword_hits": keyword_hits,
-        "parsed": parsed,
-    }
-
-    if parsed["page_kind"] == "thread_view" and name_match and visible_match:
-        return emit("verify-reply-sent", "reply_sent", data)
-    if parsed["page_kind"] == "thread_view" and name_match:
-        return emit("verify-reply-sent", "reply_send_unverified", data)
-    if parsed["page_kind"] == "thread_view":
-        return emit("verify-reply-sent", "thread_mismatch", data)
-    return emit("verify-reply-sent", "reply_send_uncertain", data)
 
 
 def command_plan_next_action(
@@ -798,9 +397,7 @@ def command_plan_next_action(
     snapshot_text: str,
     thread_id: str | None,
     candidate_override: dict[str, Any] | None,
-    allow_send: bool,
-    include_resume: bool,
-    force: bool,
+    target_candidate_name: str | None,
 ) -> int:
     parsed = parse_snapshot(config, current_url, snapshot_text)
     session_result, session_data = session_action(config, current_url, parsed["visible_text"])
@@ -815,18 +412,12 @@ def command_plan_next_action(
         thread_refs = parsed["thread_refs"]
         if not thread_refs:
             return emit("plan-next-action", "wait_for_candidates", {"parsed": parsed})
-        target_candidate_name = ""
-        if candidate_override:
-            target_candidate_name = str(candidate_override.get("candidate_name", "")).strip()
 
         selected_thread = thread_refs[0]
-        if target_candidate_name:
+        requested_name = str(target_candidate_name or "").strip()
+        if requested_name:
             matched = next(
-                (
-                    thread_ref
-                    for thread_ref in thread_refs
-                    if candidate_name_matches(target_candidate_name, str(thread_ref.get("label", "")))
-                ),
+                (item for item in thread_refs if str(item.get("label", "")).strip() == requested_name),
                 None,
             )
             if not matched:
@@ -834,7 +425,7 @@ def command_plan_next_action(
                     "plan-next-action",
                     "thread_not_found",
                     {
-                        "target_candidate_name": target_candidate_name,
+                        "target_candidate_name": requested_name,
                         "available_threads": [item.get("label", "") for item in thread_refs],
                         "parsed": parsed,
                     },
@@ -842,9 +433,8 @@ def command_plan_next_action(
             selected_thread = matched
 
         open_thread_action = build_open_thread_action(
-            config,
             selected_thread,
-            target_candidate_name or str(selected_thread.get("label", "")),
+            requested_name or str(selected_thread.get("label", "")),
         )
         return emit(
             "plan-next-action",
@@ -853,30 +443,113 @@ def command_plan_next_action(
                 "parsed": parsed,
                 "target_candidate_name": open_thread_action["candidate_name"],
                 "browser_actions": [open_thread_action],
-                "verification": open_thread_action["verification"],
             },
         )
 
     if page_kind != "thread_view":
         return emit("plan-next-action", "unknown_page", {"parsed": parsed})
 
-    candidate = merge_candidate(parsed["candidate"], candidate_override)
+    candidate = merge_candidate(config, parsed["candidate"], candidate_override)
     resolved_thread_id = derive_thread_key(candidate, thread_id)
     candidate["thread_id"] = resolved_thread_id
     parsed["candidate"] = candidate
 
-    if not candidate.get("candidate_name") or not candidate.get("job_title"):
-        return emit("plan-next-action", "candidate_incomplete", {"parsed": parsed, "candidate": candidate})
-    if not candidate.get("recent_messages"):
-        return emit("plan-next-action", "candidate_incomplete", {"parsed": parsed, "candidate": candidate})
-
-    draft_action, draft_data = evaluate_draft_reply(config, candidate, resolved_thread_id, write_state=False, force=force)
-    if draft_action in {"manual_review", "skip_duplicate"}:
-        return emit("plan-next-action", draft_action, {"parsed": parsed, "candidate": candidate, **draft_data})
-
-    action, data = build_plan_actions(config, parsed, draft_data, allow_send, include_resume)
+    data = build_llm_reply_request(config, candidate, resolved_thread_id)
     data["parsed"] = parsed
-    return emit("plan-next-action", action, data)
+    return emit("plan-next-action", "llm_reply_required", data)
+
+
+def command_finalize_reply_plan(
+    config: dict[str, Any],
+    current_url: str,
+    snapshot_text: str,
+    candidate_override: dict[str, Any] | None,
+    reply_result: dict[str, Any],
+    thread_id: str | None,
+    allow_send: bool,
+    include_resume: bool,
+) -> int:
+    parsed = parse_snapshot(config, current_url, snapshot_text)
+    session_result, session_data = session_action(config, current_url, parsed["visible_text"])
+    if session_result != "session_ok":
+        return emit("finalize-reply-plan", session_result, {"session": session_data, "parsed": parsed})
+
+    candidate = merge_candidate(config, parsed["candidate"], candidate_override)
+    resolved_thread_id = derive_thread_key(candidate, thread_id)
+    candidate["thread_id"] = resolved_thread_id
+    parsed["candidate"] = candidate
+
+    stage_hint = str(reply_result.get("conversation_stage") or candidate.get("conversation_stage") or "first_contact")
+    try:
+        normalized = normalize_llm_result(reply_result, stage_hint)
+    except ValueError as exc:
+        return emit("finalize-reply-plan", "reply_result_invalid", {}, [str(exc)], ok=False)
+
+    family = choose_job_family(str(candidate.get("job_title", "")), config["job_families"])
+    action, data = build_plan_actions(
+        parsed,
+        normalized["reply_text"],
+        resolved_thread_id,
+        normalized["conversation_stage"],
+        family.get("name", "generic"),
+        allow_send,
+        include_resume,
+    )
+
+    data["parsed"] = parsed
+    data["reply_result"] = {
+        "reply_text": normalized["reply_text"],
+        "conversation_stage": normalized["conversation_stage"],
+    }
+    return emit("finalize-reply-plan", action, data)
+
+
+def command_mark_thread(
+    config: dict[str, Any],
+    thread_id: str,
+    status: str,
+    candidate_name: str | None,
+    job_title: str | None,
+    note: str | None,
+) -> int:
+    state_path = path_from_config(config, "state", "state_file")
+    state = load_state(state_path)
+    record = state["threads"].get(thread_id, {})
+
+    if candidate_name:
+        record["candidate_name"] = candidate_name
+    if job_title:
+        record["job_title"] = job_title
+    if note:
+        record["note"] = note
+    record["thread_id"] = thread_id
+    record["updated_at"] = utc_now()
+    upsert_status(record, status)
+
+    state["threads"][thread_id] = record
+    save_state(state_path, state)
+    append_jsonl(
+        path_from_config(config, "state", "reply_log_file"),
+        {
+            "thread_id": thread_id,
+            "candidate_name": record.get("candidate_name", ""),
+            "job_title": record.get("job_title", ""),
+            "action": status,
+            "note": note or "",
+            "timestamp": utc_now(),
+        },
+    )
+    return emit("mark-thread", "state_updated", {"thread_id": thread_id, "status": status})
+
+
+def command_show_state(config: dict[str, Any], thread_id: str | None) -> int:
+    state_path = path_from_config(config, "state", "state_file")
+    state = load_state(state_path)
+    if thread_id:
+        data = {"thread_id": thread_id, "thread": state.get("threads", {}).get(thread_id)}
+    else:
+        data = state
+    return emit("show-state", "state_loaded", data)
 
 
 def command_resolve_download(
@@ -913,19 +586,6 @@ def parser() -> argparse.ArgumentParser:
     parse_snapshot_cmd.add_argument("--snapshot-text", help="Raw snapshot text.")
     parse_snapshot_cmd.add_argument("--snapshot-file", help="Snapshot text file.")
 
-    verify_thread_cmd = sub.add_parser("verify-thread-open", help="Verify that the clicked thread is the expected candidate.")
-    verify_thread_cmd.add_argument("--current-url", default="", help="Current browser URL.")
-    verify_thread_cmd.add_argument("--snapshot-text", help="Raw snapshot text.")
-    verify_thread_cmd.add_argument("--snapshot-file", help="Snapshot text file.")
-    verify_thread_cmd.add_argument("--candidate-name", required=True, help="Expected candidate name after opening the thread.")
-
-    verify_send_cmd = sub.add_parser("verify-reply-sent", help="Verify that the reply was actually sent in the expected thread.")
-    verify_send_cmd.add_argument("--current-url", default="", help="Current browser URL.")
-    verify_send_cmd.add_argument("--snapshot-text", help="Raw snapshot text.")
-    verify_send_cmd.add_argument("--snapshot-file", help="Snapshot text file.")
-    verify_send_cmd.add_argument("--candidate-name", required=True, help="Expected candidate name after sending.")
-    verify_send_cmd.add_argument("--expected-reply", required=True, help="Expected reply text that should be visible after sending.")
-
     plan = sub.add_parser("plan-next-action", help="Plan the next Browser Relay action from a snapshot.")
     plan.add_argument("--current-url", default="", help="Current browser URL.")
     plan.add_argument("--snapshot-text", help="Raw snapshot text.")
@@ -933,33 +593,25 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--thread-id", help="Stable Boss thread ID if available.")
     plan.add_argument("--candidate-json", help="Optional candidate JSON override.")
     plan.add_argument("--candidate-file", help="Optional candidate JSON override file.")
-    plan.add_argument("--allow-send", action="store_true", help="Include send-button browser actions.")
-    plan.add_argument("--include-resume", action="store_true", help="Include resume download actions when available.")
-    plan.add_argument("--force", action="store_true", help="Ignore duplicate fingerprint checks.")
+    plan.add_argument("--target-candidate-name", help="Specific candidate to open from the thread list.")
 
-    draft = sub.add_parser("draft-reply", help="Generate a reply and dedupe by thread state.")
-    draft.add_argument("--candidate-json", help="Candidate JSON string.")
-    draft.add_argument("--candidate-file", help="Candidate JSON file.")
-    draft.add_argument("--thread-id", help="Stable Boss thread ID if available.")
-    draft.add_argument("--write-state", action="store_true", help="Persist reply action and fingerprint.")
-    draft.add_argument("--force", action="store_true", help="Ignore duplicate fingerprint checks.")
+    finalize = sub.add_parser("finalize-reply-plan", help="Turn llm-task JSON output into a sendable reply plan.")
+    finalize.add_argument("--current-url", default="", help="Current browser URL.")
+    finalize.add_argument("--snapshot-text", help="Raw snapshot text.")
+    finalize.add_argument("--snapshot-file", help="Snapshot text file.")
+    finalize.add_argument("--thread-id", help="Stable Boss thread ID if available.")
+    finalize.add_argument("--candidate-json", help="Optional candidate JSON override.")
+    finalize.add_argument("--candidate-file", help="Optional candidate JSON override file.")
+    finalize.add_argument("--reply-result-json", help="Structured llm-task result JSON.")
+    finalize.add_argument("--reply-result-file", help="Structured llm-task result JSON file.")
+    finalize.add_argument("--allow-send", action="store_true", help="Include send-button browser actions.")
+    finalize.add_argument("--include-resume", action="store_true", help="Include resume download actions when available.")
 
     resolve_cmd = sub.add_parser("resolve-download", help="Resolve the newest stable download from the download directory.")
     resolve_cmd.add_argument("--download-root", help="Override download directory.")
     resolve_cmd.add_argument("--known-files-json", help="JSON list of known file paths or names.")
     resolve_cmd.add_argument("--known-files-file", help="Path to JSON list of known file paths or names.")
     resolve_cmd.add_argument("--after-epoch", type=float, help="Only consider files modified after this Unix epoch.")
-
-    rename = sub.add_parser("rename-resume", help="Rename, archive, and optionally record resume state.")
-    rename.add_argument("--source", required=True, help="Downloaded file path.")
-    rename.add_argument("--job-title", required=True, help="Candidate job title.")
-    rename.add_argument("--candidate-name", required=True, help="Candidate name.")
-    rename.add_argument("--delivery-time", required=True, help="Delivery time string.")
-    rename.add_argument("--thread-id", help="Stable Boss thread ID if available.")
-    rename.add_argument("--write-state", action="store_true", help="Persist resume archive state.")
-    rename.add_argument("--force", action="store_true", help="Ignore duplicate resume checks.")
-    rename.add_argument("--copy", action="store_true", help="Copy instead of move.")
-    rename.add_argument("--dry-run", action="store_true", help="Only calculate destination path.")
 
     mark = sub.add_parser("mark-thread", help="Mark thread status after a manual or browser step.")
     mark.add_argument("--thread-id", required=True, help="Stable Boss thread ID.")
@@ -968,7 +620,7 @@ def parser() -> argparse.ArgumentParser:
     mark.add_argument("--job-title", help="Job title.")
     mark.add_argument("--note", help="Optional note.")
 
-    show = sub.add_parser("show-state", help="Read persisted state.")
+    show = sub.add_parser("show-state", help="Read persisted runtime state.")
     show.add_argument("--thread-id", help="Optional thread ID filter.")
 
     return p
@@ -1003,26 +655,6 @@ def main() -> int:
             return emit("parse-snapshot", "snapshot_read_failed", {}, [str(exc)], ok=False)
         return command_parse_snapshot(config, args.current_url, snapshot_text)
 
-    if args.command == "verify-thread-open":
-        try:
-            snapshot_text = load_snapshot_text(args.snapshot_text, args.snapshot_file)
-        except (OSError, ValueError) as exc:
-            return emit("verify-thread-open", "snapshot_read_failed", {}, [str(exc)], ok=False)
-        return command_verify_thread_open(config, args.current_url, snapshot_text, args.candidate_name)
-
-    if args.command == "verify-reply-sent":
-        try:
-            snapshot_text = load_snapshot_text(args.snapshot_text, args.snapshot_file)
-        except (OSError, ValueError) as exc:
-            return emit("verify-reply-sent", "snapshot_read_failed", {}, [str(exc)], ok=False)
-        return command_verify_reply_sent(
-            config,
-            args.current_url,
-            snapshot_text,
-            args.candidate_name,
-            args.expected_reply,
-        )
-
     if args.command == "plan-next-action":
         try:
             snapshot_text = load_snapshot_text(args.snapshot_text, args.snapshot_file)
@@ -1031,7 +663,7 @@ def main() -> int:
 
         try:
             candidate_override = (
-                load_candidate(args.candidate_json, args.candidate_file)
+                load_json_arg(args.candidate_json, args.candidate_file, missing_message="Provide candidate JSON.")
                 if args.candidate_json or args.candidate_file
                 else None
             )
@@ -1044,17 +676,43 @@ def main() -> int:
             snapshot_text,
             args.thread_id,
             candidate_override,
-            args.allow_send,
-            args.include_resume,
-            args.force,
+            args.target_candidate_name,
         )
 
-    if args.command == "draft-reply":
+    if args.command == "finalize-reply-plan":
         try:
-            candidate = load_candidate(args.candidate_json, args.candidate_file)
+            snapshot_text = load_snapshot_text(args.snapshot_text, args.snapshot_file)
+        except (OSError, ValueError) as exc:
+            return emit("finalize-reply-plan", "snapshot_read_failed", {}, [str(exc)], ok=False)
+
+        try:
+            candidate_override = (
+                load_json_arg(args.candidate_json, args.candidate_file, missing_message="Provide candidate JSON.")
+                if args.candidate_json or args.candidate_file
+                else None
+            )
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            return emit("draft-reply", "candidate_read_failed", {}, [str(exc)], ok=False)
-        return command_draft_reply(config, candidate, args.thread_id, args.write_state, args.force)
+            return emit("finalize-reply-plan", "candidate_read_failed", {}, [str(exc)], ok=False)
+
+        try:
+            reply_result = load_json_arg(
+                args.reply_result_json,
+                args.reply_result_file,
+                missing_message="Provide --reply-result-json or --reply-result-file.",
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            return emit("finalize-reply-plan", "reply_result_read_failed", {}, [str(exc)], ok=False)
+
+        return command_finalize_reply_plan(
+            config,
+            args.current_url,
+            snapshot_text,
+            candidate_override,
+            reply_result,
+            args.thread_id,
+            args.allow_send,
+            args.include_resume,
+        )
 
     if args.command == "resolve-download":
         return command_resolve_download(
@@ -1063,20 +721,6 @@ def main() -> int:
             args.known_files_json,
             args.known_files_file,
             args.after_epoch,
-        )
-
-    if args.command == "rename-resume":
-        return command_rename_resume(
-            config,
-            args.source,
-            args.job_title,
-            args.candidate_name,
-            args.delivery_time,
-            args.thread_id,
-            args.write_state,
-            args.force,
-            args.copy,
-            args.dry_run,
         )
 
     if args.command == "mark-thread":
