@@ -1,0 +1,21 @@
+{
+  "id": "boss-hr-runner",
+  "name": "Boss HR Runner",
+  "description": "Registers /boss_hr_drain and the optional boss_hr_runner tool.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pythonBin": {
+        "type": "string"
+      },
+      "agentId": {
+        "type": "string"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000
+      }
+    }
+  }
+}
